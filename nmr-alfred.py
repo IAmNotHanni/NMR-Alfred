@@ -809,7 +809,8 @@ class App(tk.Tk):
         self.start_manual_scan_btn.pack(side=tk.LEFT)
         self.stop_manual_scan_btn = ttk.Button(bar, text="Stop Manual Scan", command=self.abort_scan, state=tk.DISABLED)
         self.stop_manual_scan_btn.pack(side=tk.LEFT, padx=6)
-        ttk.Button(bar, text="Simulate Scan", command=self.simulate_scan_all_now).pack(side=tk.LEFT, padx=6)
+        self.simulate_scan_all_btn = ttk.Button(bar, text="Simulate Scan", command=self.simulate_scan_all_now)
+        self.simulate_scan_all_btn.pack(side=tk.LEFT, padx=6)
         self.status_var = tk.StringVar(value="Monitoring stopped")
         ttk.Label(bar, textvariable=self.status_var).pack(side=tk.LEFT, padx=12)
         ttk.Label(bar, textvariable=self.next_scan_var).pack(side=tk.LEFT, padx=12)
@@ -837,8 +838,12 @@ class App(tk.Tk):
             buttons, text="Remove Selected NMR Folder", command=self.remove_folders, state=tk.DISABLED
         )
         self.remove_folder_btn.pack(side=tk.LEFT)
-        ttk.Button(buttons, text="Scan Selected NMR Folder", command=self.scan_selected_now).pack(side=tk.RIGHT)
-        ttk.Button(buttons, text="Simulate Selected NMR Folder", command=self.simulate_scan_selected_now).pack(side=tk.RIGHT, padx=6)
+        self.scan_selected_btn = ttk.Button(buttons, text="Scan Selected NMR Folder", command=self.scan_selected_now)
+        self.scan_selected_btn.pack(side=tk.RIGHT)
+        self.simulate_scan_selected_btn = ttk.Button(
+            buttons, text="Simulate Selected NMR Folder", command=self.simulate_scan_selected_now
+        )
+        self.simulate_scan_selected_btn.pack(side=tk.RIGHT, padx=6)
 
         progress = ttk.LabelFrame(parent, text="Scan progress", padding=8)
         progress.pack(fill=tk.X, pady=(8, 0))
@@ -867,9 +872,12 @@ class App(tk.Tk):
 
         rule_buttons = ttk.Frame(parent, padding=(0, 8, 0, 0))
         rule_buttons.pack(fill=tk.X)
-        ttk.Button(rule_buttons, text="Add rule", command=self.open_add_rule_dialog).pack(side=tk.LEFT)
-        ttk.Button(rule_buttons, text="Edit Rule", command=self.open_edit_selected_rule_dialog).pack(side=tk.LEFT, padx=4)
-        ttk.Button(rule_buttons, text="Delete Rule", command=self.delete_rule).pack(side=tk.LEFT)
+        self.add_rule_btn = ttk.Button(rule_buttons, text="Add rule", command=self.open_add_rule_dialog)
+        self.add_rule_btn.pack(side=tk.LEFT)
+        self.edit_rule_btn = ttk.Button(rule_buttons, text="Edit Rule", command=self.open_edit_selected_rule_dialog)
+        self.edit_rule_btn.pack(side=tk.LEFT, padx=4)
+        self.delete_rule_btn = ttk.Button(rule_buttons, text="Delete Rule", command=self.delete_rule)
+        self.delete_rule_btn.pack(side=tk.LEFT)
 
     def _build_copies_tab(self, parent):
         top = ttk.Frame(parent)
@@ -959,6 +967,23 @@ class App(tk.Tk):
         state = tk.NORMAL if self.folder_tree.selection() else tk.DISABLED
         self.edit_folder_btn.configure(state=state)
         self.remove_folder_btn.configure(state=state)
+        self._update_folder_action_states()
+
+    def _update_folder_action_states(self):
+        has_folders = bool(self.config_data["folders"])
+        state = tk.NORMAL if has_folders else tk.DISABLED
+        self.simulate_scan_all_btn.configure(state=state)
+        self.scan_selected_btn.configure(state=state)
+        self.simulate_scan_selected_btn.configure(state=state)
+        self.start_monitor_btn.configure(
+            state=tk.NORMAL if has_folders and not self.monitor.running else tk.DISABLED
+        )
+        self.start_manual_scan_btn.configure(
+            state=tk.NORMAL if has_folders and not self.monitor.session_lock.locked() else tk.DISABLED
+        )
+        self.add_rule_btn.configure(state=state)
+        self.edit_rule_btn.configure(state=state)
+        self.delete_rule_btn.configure(state=state)
 
     def open_selected_watch_folder(self, event=None):
         item_id = self.folder_tree.identify_row(event.y) if event is not None else self.folder_tree.selection()
@@ -1586,9 +1611,8 @@ class App(tk.Tk):
             self.status_var.set("Stopping...")
         else:
             self.status_var.set("Monitoring stopped")
-        self.start_monitor_btn.configure(state=tk.DISABLED if monitoring_active else tk.NORMAL)
+        self._update_folder_action_states()
         self.stop_monitor_btn.configure(state=tk.NORMAL if monitoring_active else tk.DISABLED)
-        self.start_manual_scan_btn.configure(state=tk.DISABLED if scan_active else tk.NORMAL)
         self.stop_manual_scan_btn.configure(state=tk.NORMAL if scan_active else tk.DISABLED)
         self._update_next_scan_text()
 
