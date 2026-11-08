@@ -8,12 +8,18 @@ import shutil
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.request
+import webbrowser
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "nmr-alfred-config.json")
+CURRENT_VERSION = "0.1.2"
+LATEST_RELEASE_API = "https://api.github.com/repos/IAmNotHanni/NMR-Alfred/releases/latest"
+RELEASES_PAGE_URL = "https://github.com/IAmNotHanni/NMR-Alfred/releases"
 
 INTERVALS = {
     "5 min": 5 * 60,
@@ -168,6 +174,51 @@ def cleanup_missing_destinations(cfg):
     return changed
 
 
+def cleanup_rules_without_sources(cfg):
+    rules = cfg.get("rules", [])
+    removed_rules = [rule for rule in rules if not rule.get("sources")]
+    if not removed_rules:
+        return []
+    cfg["rules"] = [rule for rule in rules if rule.get("sources")]
+    try:
+        save_config(cfg)
+    except Exception as e:
+        log(f"[ERROR] Could not save config after removing rules without watched folders: {e}")
+    return removed_rules
+
+
+def cleanup_duplicate_nickname_folders(cfg):
+    nickname_counts = {}
+    for folder in cfg.get("folders", []):
+        nickname = str(folder.get("nickname", "")).strip().casefold()
+        if nickname:
+            nickname_counts[nickname] = nickname_counts.get(nickname, 0) + 1
+
+    duplicate_folders = [
+        folder for folder in cfg.get("folders", [])
+        if nickname_counts.get(str(folder.get("nickname", "")).strip().casefold(), 0) > 1
+    ]
+    if not duplicate_folders:
+        return [], []
+
+    duplicate_paths = [folder["path"] for folder in duplicate_folders]
+    removed_rules = [
+        rule for rule in cfg.get("rules", [])
+        if any(
+            same_path(source, path)
+            for source in rule.get("sources", [])
+            for path in duplicate_paths
+        )
+    ]
+    cfg["folders"] = [folder for folder in cfg.get("folders", []) if folder not in duplicate_folders]
+    cfg["rules"] = [rule for rule in cfg.get("rules", []) if rule not in removed_rules]
+    try:
+        save_config(cfg)
+    except Exception as e:
+        log(f"[ERROR] Could not save config after removing duplicate-nickname folders: {e}")
+    return duplicate_folders, removed_rules
+
+
 def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -175,6 +226,42 @@ def save_config(cfg):
 
 def same_path(a, b):
     return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def extract_nmr_nickname(path):
+    matches = list(re.finditer(r"(?<![A-Za-z0-9])(\d{3}\s*MHz[^/\\]*)", path, re.IGNORECASE))
+    return matches[-1].group(1) if matches else ""
+
+
+def unique_nmr_nickname(nickname, folders, exclude_index=None):
+    base = nickname.strip()
+    existing = {
+        str(folder.get("nickname", "")).strip().casefold()
+        for index, folder in enumerate(folders)
+        if index != exclude_index
+    }
+    if base.casefold() not in existing:
+        return base
+    suffix = 2
+    while f"{base} ({suffix})".casefold() in existing:
+        suffix += 1
+    return f"{base} ({suffix})"
+
+
+def version_tuple(version):
+    match = re.fullmatch(r"[vV]?(\d+(?:\.\d+)*)", version.strip())
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+
+
+def is_newer_version(candidate, current):
+    candidate_version = version_tuple(candidate)
+    current_version = version_tuple(current)
+    if candidate_version is None or current_version is None:
+        return False
+    length = max(len(candidate_version), len(current_version))
+    return candidate_version + (0,) * (length - len(candidate_version)) > (
+        current_version + (0,) * (length - len(current_version))
+    )
 
 
 def paths_overlap(a, b):
@@ -723,15 +810,18 @@ class Monitor:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("NMR Alfred v0.1.1")
+        self.title(f"NMR Alfred v{CURRENT_VERSION}")
         self.geometry("1000x720")
         self.minsize(1000, 720)
 
         self.config_data = load_config()
         cleanup_missing_destinations(self.config_data)
+        duplicate_folders, duplicate_nickname_rules = cleanup_duplicate_nickname_folders(self.config_data)
+        removed_rules = cleanup_rules_without_sources(self.config_data)
         self.config_lock = threading.Lock()
         self.log_queue = queue.Queue()
         self.copy_queue = queue.Queue()
+        self.update_queue = queue.Queue()
         self.scan_progress_queue = queue.Queue()
         self.copy_history = load_copy_history()
         self.copy_log_lock = threading.Lock()
@@ -754,11 +844,34 @@ class App(tk.Tk):
         self.refresh_rules()
         self.refresh_copy_history()
         self.new_rule()
+        startup_warnings = []
+        if duplicate_folders:
+            folder_names = "\n".join(
+                f"- {folder.get('nickname', '')}: {folder['path']}" for folder in duplicate_folders
+            )
+            startup_warnings.append(
+                f"{len(duplicate_folders)} folder(s) with duplicate nicknames and "
+                f"{len(duplicate_nickname_rules)} associated rule(s) were removed:\n{folder_names}"
+            )
+        if removed_rules:
+            rule_names = "\n".join(
+                f"- {rule.get('expression') or '(unnamed rule)'}" for rule in removed_rules
+            )
+            startup_warnings.append(
+                f"{len(removed_rules)} rule(s) without watched NMR folders were removed:\n{rule_names}"
+            )
+        if startup_warnings:
+            self.after_idle(lambda: messagebox.showwarning(
+                "Configuration cleaned",
+                "\n\n".join(startup_warnings),
+                parent=self,
+            ))
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(200, self._poll_log)
         self.after(50, self._poll_scan_progress)
         self.after(1000, self._tick)
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
 
     # ---------------------------------------------------------------- config
     def get_config_snapshot(self):
@@ -780,9 +893,11 @@ class App(tk.Tk):
         tab_folders = ttk.Frame(notebook, padding=8)
         tab_rules = ttk.Frame(notebook, padding=8)
         tab_copies = ttk.Frame(notebook, padding=8)
+        tab_about = ttk.Frame(notebook, padding=8)
         notebook.add(tab_folders, text="Watched NMR Folders")
         notebook.add(tab_rules, text="NMR Copy Rules")
         notebook.add(tab_copies, text="Copied Files")
+        notebook.add(tab_about, text="About")
         paned = ttk.PanedWindow(tab_folders, orient=tk.VERTICAL)
         paned.pack(fill=tk.BOTH, expand=True)
         folders_frame = ttk.Frame(paned)
@@ -790,6 +905,10 @@ class App(tk.Tk):
         self._build_folders_tab(folders_frame)
         self._build_rules_tab(tab_rules)
         self._build_copies_tab(tab_copies)
+        ttk.Label(tab_about, text="(c) 2026 Johannes Schneider, www.johannes-schneider.de, MIT License").pack(pady=(24, 12))
+        ttk.Button(
+            tab_about, text="Check for Updates", command=self.open_releases_page
+        ).pack()
 
         log_frame = ttk.LabelFrame(paned, text="Log", padding=4)
         paned.add(log_frame, weight=1)
@@ -798,6 +917,8 @@ class App(tk.Tk):
         self.log_text.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.no_rules_log_label = ttk.Label(log_frame, text="Specify NMR copy rules")
+        self.no_rules_log_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
         bar = ttk.Frame(tab_folders, padding=(0, 6, 0, 0))
         bar.pack(fill=tk.X)
@@ -809,7 +930,8 @@ class App(tk.Tk):
         self.start_manual_scan_btn.pack(side=tk.LEFT)
         self.stop_manual_scan_btn = ttk.Button(bar, text="Stop Manual Scan", command=self.abort_scan, state=tk.DISABLED)
         self.stop_manual_scan_btn.pack(side=tk.LEFT, padx=6)
-        ttk.Button(bar, text="Simulate Scan", command=self.simulate_scan_all_now).pack(side=tk.LEFT, padx=6)
+        self.simulate_scan_all_btn = ttk.Button(bar, text="Simulate Scan", command=self.simulate_scan_all_now)
+        self.simulate_scan_all_btn.pack(side=tk.LEFT, padx=6)
         self.status_var = tk.StringVar(value="Monitoring stopped")
         ttk.Label(bar, textvariable=self.status_var).pack(side=tk.LEFT, padx=12)
         ttk.Label(bar, textvariable=self.next_scan_var).pack(side=tk.LEFT, padx=12)
@@ -820,7 +942,7 @@ class App(tk.Tk):
         self.folder_tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="extended")
         for col, text, width in (("path", "Folder", 460), ("nickname", "Nickname", 140), ("interval", "Check every", 90),
                                  ("last", "Last scan", 140), ("next", "Next scan", 140)):
-            self.folder_tree.heading(col, text=text)
+            self.folder_tree.heading(col, text=text, anchor=tk.W)
             self.folder_tree.column(col, width=width, stretch=(col == "path"))
         self.folder_tree.pack(fill=tk.BOTH, expand=True)
         self.folder_tree.bind("<<TreeviewSelect>>", self.on_folder_select)
@@ -837,8 +959,12 @@ class App(tk.Tk):
             buttons, text="Remove Selected NMR Folder", command=self.remove_folders, state=tk.DISABLED
         )
         self.remove_folder_btn.pack(side=tk.LEFT)
-        ttk.Button(buttons, text="Scan Selected NMR Folder", command=self.scan_selected_now).pack(side=tk.RIGHT)
-        ttk.Button(buttons, text="Simulate Selected NMR Folder", command=self.simulate_scan_selected_now).pack(side=tk.RIGHT, padx=6)
+        self.scan_selected_btn = ttk.Button(buttons, text="Scan Selected NMR Folder", command=self.scan_selected_now)
+        self.scan_selected_btn.pack(side=tk.RIGHT)
+        self.simulate_scan_selected_btn = ttk.Button(
+            buttons, text="Simulate Selected NMR Folder", command=self.simulate_scan_selected_now
+        )
+        self.simulate_scan_selected_btn.pack(side=tk.RIGHT, padx=6)
 
         progress = ttk.LabelFrame(parent, text="Scan progress", padding=8)
         progress.pack(fill=tk.X, pady=(8, 0))
@@ -855,21 +981,28 @@ class App(tk.Tk):
 
     def _build_rules_tab(self, parent):
         columns = ("enabled", "expression", "match", "sources", "destinations")
-        self.rule_tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse", height=6)
+        rule_tree_frame = ttk.Frame(parent)
+        rule_tree_frame.pack(fill=tk.BOTH, expand=True)
+        self.rule_tree = ttk.Treeview(rule_tree_frame, columns=columns, show="headings", selectmode="browse", height=6)
         for col, text, width in (("enabled", "Enabled", 60), ("expression", "Expression", 160), ("match", "Match", 90),
                                  ("sources", "Watched NMR Folders", 330), ("destinations", "Copy to", 330)):
-            self.rule_tree.heading(col, text=text)
+            self.rule_tree.heading(col, text=text, anchor=tk.W)
             self.rule_tree.column(col, width=width, anchor=tk.CENTER if col == "enabled" else tk.W)
         self.rule_tree.pack(fill=tk.BOTH, expand=True)
+        self.no_folders_label = ttk.Label(rule_tree_frame, text="Add NMR folders to watch first")
+        self.no_folders_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         self.rule_tree.bind("<<TreeviewSelect>>", self.on_rule_select)
         self.rule_tree.bind("<Button-1>", self.on_rule_click)
         self.rule_tree.bind("<Delete>", self.delete_rule)
 
         rule_buttons = ttk.Frame(parent, padding=(0, 8, 0, 0))
         rule_buttons.pack(fill=tk.X)
-        ttk.Button(rule_buttons, text="Add rule", command=self.open_add_rule_dialog).pack(side=tk.LEFT)
-        ttk.Button(rule_buttons, text="Edit Rule", command=self.open_edit_selected_rule_dialog).pack(side=tk.LEFT, padx=4)
-        ttk.Button(rule_buttons, text="Delete Rule", command=self.delete_rule).pack(side=tk.LEFT)
+        self.add_rule_btn = ttk.Button(rule_buttons, text="Add rule", command=self.open_add_rule_dialog)
+        self.add_rule_btn.pack(side=tk.LEFT)
+        self.edit_rule_btn = ttk.Button(rule_buttons, text="Edit Rule", command=self.open_edit_selected_rule_dialog)
+        self.edit_rule_btn.pack(side=tk.LEFT, padx=4)
+        self.delete_rule_btn = ttk.Button(rule_buttons, text="Delete Rule", command=self.delete_rule)
+        self.delete_rule_btn.pack(side=tk.LEFT)
 
     def _build_copies_tab(self, parent):
         top = ttk.Frame(parent)
@@ -899,7 +1032,7 @@ class App(tk.Tk):
             ("source", "Source folder", 260),
             ("destination", "Copied to", 320),
         ):
-            self.copy_tree.heading(col, text=text)
+            self.copy_tree.heading(col, text=text, anchor=tk.W)
             self.copy_tree.column(col, width=width, stretch=(col in ("source", "destination")))
         scroll = ttk.Scrollbar(frame, command=self.copy_tree.yview)
         self.copy_tree.configure(yscrollcommand=scroll.set)
@@ -959,6 +1092,34 @@ class App(tk.Tk):
         state = tk.NORMAL if self.folder_tree.selection() else tk.DISABLED
         self.edit_folder_btn.configure(state=state)
         self.remove_folder_btn.configure(state=state)
+        self._update_folder_action_states()
+
+    def _update_folder_action_states(self):
+        has_folders = bool(self.config_data["folders"])
+        has_rules = bool(self.config_data["rules"])
+        state = tk.NORMAL if has_folders else tk.DISABLED
+        scan_state = tk.NORMAL if has_folders and has_rules else tk.DISABLED
+        self.simulate_scan_all_btn.configure(state=scan_state)
+        self.scan_selected_btn.configure(state=scan_state)
+        self.simulate_scan_selected_btn.configure(state=scan_state)
+        self.start_monitor_btn.configure(
+            state=tk.NORMAL if has_folders and has_rules and not self.monitor.running else tk.DISABLED
+        )
+        self.start_manual_scan_btn.configure(
+            state=tk.NORMAL if has_folders and has_rules and not self.monitor.session_lock.locked() else tk.DISABLED
+        )
+        self.add_rule_btn.configure(state=state)
+        self.edit_rule_btn.configure(state=state)
+        self.delete_rule_btn.configure(state=state)
+        if has_folders:
+            self.no_folders_label.place_forget()
+        else:
+            self.no_folders_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        if has_folders and not has_rules:
+            self.no_rules_log_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+            self.no_rules_log_label.lift()
+        else:
+            self.no_rules_log_label.place_forget()
 
     def open_selected_watch_folder(self, event=None):
         item_id = self.folder_tree.identify_row(event.y) if event is not None else self.folder_tree.selection()
@@ -1006,6 +1167,7 @@ class App(tk.Tk):
 
         ttk.Label(outer, text="Folder").grid(row=0, column=0, sticky="w")
         path_var = tk.StringVar()
+        auto_nickname = {"value": ""}
         ttk.Entry(outer, textvariable=path_var, width=48).grid(
             row=0, column=1, columnspan=3, sticky="ew", padx=6
         )
@@ -1033,6 +1195,20 @@ class App(tk.Tk):
             nickname_var.set(folder.get("nickname", ""))
             interval_var.set(folder.get("interval", DEFAULT_INTERVAL))
 
+        def update_nickname_from_path(*_):
+            extracted_nickname = extract_nmr_nickname(path_var.get())
+            current_nickname = nickname_var.get()
+            if extracted_nickname and (
+                not current_nickname or current_nickname == auto_nickname["value"]
+            ):
+                nickname = unique_nmr_nickname(
+                    extracted_nickname, self.config_data["folders"], folder_index
+                )
+                nickname_var.set(nickname)
+                auto_nickname["value"] = nickname
+
+        path_var.trace_add("write", update_nickname_from_path)
+
         button_row = ttk.Frame(outer)
         button_row.grid(row=2, column=0, columnspan=5, sticky="e", pady=(8, 0))
 
@@ -1044,6 +1220,17 @@ class App(tk.Tk):
             nickname = nickname_var.get().strip()
             if not nickname:
                 messagebox.showwarning("Missing nickname", "Please enter an NMR nickname.", parent=dialog)
+                return
+            if any(
+                i != folder_index
+                and str(folder.get("nickname", "")).strip().casefold() == nickname.casefold()
+                for i, folder in enumerate(self.config_data["folders"])
+            ):
+                messagebox.showwarning(
+                    "Duplicate nickname",
+                    "Each watched NMR folder must have a unique nickname.",
+                    parent=dialog,
+                )
                 return
             if add_mode:
                 if any(same_path(path, f["path"]) for f in self.config_data["folders"]):
@@ -1074,7 +1261,7 @@ class App(tk.Tk):
         ttk.Button(button_row, text="Save", command=save_folder).pack(side=tk.RIGHT, padx=(0, 6))
 
         dialog.update_idletasks()
-        width = dialog.winfo_reqwidth()
+        width = int(dialog.winfo_reqwidth() * 1.33)
         height = dialog.winfo_reqheight()
         dialog.minsize(width, height)
         self._center_dialog(dialog, width, height)
@@ -1085,14 +1272,37 @@ class App(tk.Tk):
         sel = self.folder_tree.selection()
         if not sel:
             return
-        if not messagebox.askyesno("Remove", f"Remove {len(sel)} watched folder(s)?"):
-            return
         indices = sorted((int(i) for i in sel), reverse=True)
+        paths_to_remove = [
+            self.config_data["folders"][i]["path"]
+            for i in indices
+            if 0 <= i < len(self.config_data["folders"])
+        ]
+        affected_rules = [
+            rule for rule in self.config_data["rules"]
+            if any(
+                same_path(source, path)
+                for source in rule.get("sources", [])
+                for path in paths_to_remove
+            )
+        ]
+        message = f"Remove {len(paths_to_remove)} watched folder(s)?"
+        if affected_rules:
+            message += (
+                f"\n\n{len(affected_rules)} associated NMR rule(s) will also be deleted."
+            )
+        if not messagebox.askyesno("Remove", message, icon="warning", parent=self):
+            return
         with self.config_lock:
             removed = [self.config_data["folders"].pop(i)["path"] for i in indices]
-            for rule in self.config_data["rules"]:
-                rule["sources"] = [s for s in rule.get("sources", [])
-                                   if not any(same_path(s, r) for r in removed)]
+            self.config_data["rules"] = [
+                rule for rule in self.config_data["rules"]
+                if not any(
+                    same_path(source, path)
+                    for source in rule.get("sources", [])
+                    for path in removed
+                )
+            ]
         self.persist()
         self.folder_tree.selection_set(())
         self.refresh_folders()
@@ -1258,6 +1468,7 @@ class App(tk.Tk):
             ))
         if self.selected_rule_index is not None and self.rule_tree.exists(str(self.selected_rule_index)):
             self.rule_tree.selection_set(str(self.selected_rule_index))
+        self._update_folder_action_states()
 
     def on_rule_click(self, event):
         if self.rule_tree.identify_column(event.x) != "#1":
@@ -1298,12 +1509,61 @@ class App(tk.Tk):
         self.selected_rule_index = None
         self.rule_tree.selection_set(())
 
+    def _create_rule_source_tree(self, parent, selected_sources):
+        source_frame = ttk.Frame(parent)
+        source_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
+        source_frame.rowconfigure(0, weight=1)
+        source_frame.columnconfigure(0, weight=1)
+
+        source_tree = ttk.Treeview(
+            source_frame, columns=("selected", "path"), show="headings", selectmode="none"
+        )
+        source_tree.heading("selected", text="Use", anchor=tk.W)
+        source_tree.heading("path", text="Watched folder", anchor=tk.W)
+        source_tree.column("selected", width=42, minwidth=42, stretch=False, anchor=tk.CENTER)
+        source_tree.column("path", width=680, minwidth=200, stretch=True)
+
+        vertical_scroll = ttk.Scrollbar(source_frame, orient=tk.VERTICAL, command=source_tree.yview)
+        horizontal_scroll = ttk.Scrollbar(source_frame, orient=tk.HORIZONTAL, command=source_tree.xview)
+        source_tree.configure(yscrollcommand=vertical_scroll.set, xscrollcommand=horizontal_scroll.set)
+        source_tree.grid(row=0, column=0, sticky="nsew")
+        vertical_scroll.grid(row=0, column=1, sticky="ns")
+        horizontal_scroll.grid(row=1, column=0, sticky="ew")
+
+        for index, folder in enumerate(self.config_data["folders"]):
+            path = folder["path"]
+            checked = any(same_path(path, selected) for selected in selected_sources)
+            source_tree.insert(
+                "", tk.END, iid=str(index),
+                values=("\u2611" if checked else "\u2610", path),
+            )
+        source_tree.bind("<Button-1>", lambda event: self._toggle_rule_source(event, source_tree))
+        return source_tree
+
+    def _toggle_rule_source(self, event, source_tree):
+        if source_tree.identify_column(event.x) != "#1":
+            return
+        item = source_tree.identify_row(event.y)
+        if not item:
+            return
+        checkbox = source_tree.set(item, "selected")
+        source_tree.set(item, "selected", "\u2610" if checkbox == "\u2611" else "\u2611")
+        return "break"
+
+    @staticmethod
+    def _selected_rule_sources(source_tree):
+        return [
+            source_tree.set(item, "path")
+            for item in source_tree.get_children()
+            if source_tree.set(item, "selected") == "\u2611"
+        ]
+
     def open_add_rule_dialog(self):
         dialog = tk.Toplevel(self)
         dialog.withdraw()
         dialog.title("Add NMR Rule")
         dialog.transient(self)
-        dialog.minsize(760, 400)
+        dialog.minsize(760, 600)
 
         outer = ttk.Frame(dialog, padding=10)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -1327,19 +1587,23 @@ class App(tk.Tk):
         lists = ttk.Frame(outer)
         lists.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         lists.columnconfigure(0, weight=1)
-        lists.columnconfigure(1, weight=1)
         lists.rowconfigure(1, weight=1)
+        lists.rowconfigure(3, weight=1)
 
         ttk.Label(lists, text="Watched folders for this rule").grid(row=0, column=0, sticky="w")
-        source_list = tk.Listbox(lists, selectmode=tk.MULTIPLE, exportselection=False)
-        source_list.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
+        selected_sources = [
+            self.config_data["folders"][int(i)]["path"]
+            for i in self.folder_tree.selection()
+            if 0 <= int(i) < len(self.config_data["folders"])
+        ]
+        source_tree = self._create_rule_source_tree(lists, selected_sources)
 
-        ttk.Label(lists, text="Copy results to").grid(row=0, column=1, sticky="w")
+        ttk.Label(lists, text="Copy results to").grid(row=2, column=0, sticky="w", pady=(6, 0))
         dest_list = tk.Listbox(lists, selectmode=tk.EXTENDED, exportselection=False)
-        dest_list.grid(row=1, column=1, sticky="nsew")
+        dest_list.grid(row=3, column=0, sticky="nsew", padx=(0, 6))
 
         button_row = ttk.Frame(lists)
-        button_row.grid(row=2, column=1, sticky="w", pady=(4, 0))
+        button_row.grid(row=4, column=0, sticky="w", pady=(4, 0))
 
         def add_destination():
             path = filedialog.askdirectory(parent=dialog, title="Select destination folder")
@@ -1356,17 +1620,6 @@ class App(tk.Tk):
         ttk.Button(button_row, text="Add Destination Folder", command=add_destination).pack(side=tk.LEFT)
         ttk.Button(button_row, text="Remove Destination Folder", command=remove_destination).pack(side=tk.LEFT, padx=4)
 
-        source_names = [folder["path"] for folder in self.config_data["folders"]]
-        for path in source_names:
-            source_list.insert(tk.END, path)
-
-        selected_sources = self.folder_tree.selection()
-        if selected_sources:
-            for iid in selected_sources:
-                idx = int(iid)
-                if 0 <= idx < len(source_names):
-                    source_list.selection_set(idx)
-
         action_bar = ttk.Frame(outer)
         action_bar.grid(row=2, column=0, sticky="e", pady=(10, 0))
 
@@ -1381,7 +1634,7 @@ class App(tk.Tk):
                 except re.error as e:
                     messagebox.showerror("Invalid regex", str(e), parent=dialog)
                     return
-            sources = [source_list.get(i) for i in source_list.curselection()]
+            sources = self._selected_rule_sources(source_tree)
             destinations = list(dest_list.get(0, tk.END))
             if not sources:
                 messagebox.showwarning("No folders", "Select at least one watched folder.", parent=dialog)
@@ -1415,7 +1668,7 @@ class App(tk.Tk):
         ttk.Button(action_bar, text="Add rule", command=save_new_rule).pack(side=tk.RIGHT, padx=(0, 6))
 
         dialog.update_idletasks()
-        self._center_dialog(dialog, 820, 400)
+        self._center_dialog(dialog, 820, 680)
         dialog.deiconify()
         dialog.grab_set()
 
@@ -1432,9 +1685,8 @@ class App(tk.Tk):
         dialog = tk.Toplevel(self)
         dialog.title("Edit rule")
         dialog.transient(self)
-        dialog.grab_set()
-        dialog.geometry("820x620")
-        dialog.minsize(760, 560)
+        dialog.geometry("820x760")
+        dialog.minsize(760, 620)
 
         outer = ttk.Frame(dialog, padding=10)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -1463,19 +1715,18 @@ class App(tk.Tk):
         lists = ttk.Frame(outer)
         lists.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         lists.columnconfigure(0, weight=1)
-        lists.columnconfigure(1, weight=1)
         lists.rowconfigure(1, weight=1)
+        lists.rowconfigure(3, weight=1)
 
         ttk.Label(lists, text="Watched folders for this rule").grid(row=0, column=0, sticky="w")
-        source_list = tk.Listbox(lists, selectmode=tk.MULTIPLE, exportselection=False)
-        source_list.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
+        source_tree = self._create_rule_source_tree(lists, rule.get("sources", []))
 
-        ttk.Label(lists, text="Copy results to").grid(row=0, column=1, sticky="w")
+        ttk.Label(lists, text="Copy results to").grid(row=2, column=0, sticky="w", pady=(6, 0))
         dest_list = tk.Listbox(lists, selectmode=tk.EXTENDED, exportselection=False)
-        dest_list.grid(row=1, column=1, sticky="nsew")
+        dest_list.grid(row=3, column=0, sticky="nsew", padx=(0, 6))
 
         button_row = ttk.Frame(lists)
-        button_row.grid(row=2, column=1, sticky="w", pady=(4, 0))
+        button_row.grid(row=4, column=0, sticky="w", pady=(4, 0))
 
         def add_destination():
             path = filedialog.askdirectory(parent=dialog, title="Select destination folder")
@@ -1491,14 +1742,6 @@ class App(tk.Tk):
 
         ttk.Button(button_row, text="Add destination...", command=add_destination).pack(side=tk.LEFT)
         ttk.Button(button_row, text="Remove destination", command=remove_destination).pack(side=tk.LEFT, padx=4)
-
-        source_names = [folder["path"] for folder in self.config_data["folders"]]
-        for path in source_names:
-            source_list.insert(tk.END, path)
-        for src in rule.get("sources", []):
-            for i, path in enumerate(source_names):
-                if same_path(path, src):
-                    source_list.selection_set(i)
 
         for dest in rule.get("destinations", []):
             dest_list.insert(tk.END, dest)
@@ -1517,7 +1760,7 @@ class App(tk.Tk):
                 except re.error as e:
                     messagebox.showerror("Invalid regex", str(e), parent=dialog)
                     return
-            sources = [source_list.get(i) for i in source_list.curselection()]
+            sources = self._selected_rule_sources(source_tree)
             destinations = list(dest_list.get(0, tk.END))
             if not sources:
                 messagebox.showwarning("No folders", "Select at least one watched folder.", parent=dialog)
@@ -1549,6 +1792,10 @@ class App(tk.Tk):
 
         ttk.Button(action_bar, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
         ttk.Button(action_bar, text="Save changes", command=save_edited_rule).pack(side=tk.RIGHT, padx=(0, 6))
+
+        dialog.update_idletasks()
+        self._center_dialog(dialog, 820, 760)
+        dialog.grab_set()
 
     def delete_rule(self):
         sel = self.rule_tree.selection()
@@ -1586,9 +1833,8 @@ class App(tk.Tk):
             self.status_var.set("Stopping...")
         else:
             self.status_var.set("Monitoring stopped")
-        self.start_monitor_btn.configure(state=tk.DISABLED if monitoring_active else tk.NORMAL)
+        self._update_folder_action_states()
         self.stop_monitor_btn.configure(state=tk.NORMAL if monitoring_active else tk.DISABLED)
-        self.start_manual_scan_btn.configure(state=tk.DISABLED if scan_active else tk.NORMAL)
         self.stop_manual_scan_btn.configure(state=tk.NORMAL if scan_active else tk.DISABLED)
         self._update_next_scan_text()
 
@@ -1637,8 +1883,79 @@ class App(tk.Tk):
         remaining = next_due - now
         self.next_scan_var.set(f"Next scan in {self._format_duration(remaining)} ({next_label})")
 
+    def _check_for_updates(self):
+        request = urllib.request.Request(
+            LATEST_RELEASE_API,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "NMR-Alfred",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                release = json.load(response)
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            log(f"[WARNING] Could not check for updates: {e}")
+            return
+
+        if not isinstance(release, dict):
+            log("[WARNING] Could not check for updates: invalid release response.")
+            return
+        latest_version = release.get("tag_name")
+        release_url = release.get("html_url")
+        if not isinstance(latest_version, str) or not isinstance(release_url, str):
+            log("[WARNING] Could not check for updates: release response is missing version or URL.")
+            return
+        if is_newer_version(latest_version, CURRENT_VERSION):
+            self.update_queue.put((latest_version, release_url))
+
+    def open_releases_page(self):
+        try:
+            opened = webbrowser.open(RELEASES_PAGE_URL)
+        except OSError as e:
+            log(f"[ERROR] Could not open releases page {RELEASES_PAGE_URL}: {e}")
+            messagebox.showerror(
+                "Could not open browser",
+                f"Could not open the releases page:\n{RELEASES_PAGE_URL}\n\n{e}",
+                parent=self,
+            )
+        else:
+            if not opened:
+                log(f"[ERROR] Could not open releases page {RELEASES_PAGE_URL}.")
+                messagebox.showerror(
+                    "Could not open browser",
+                    f"Could not open the releases page:\n{RELEASES_PAGE_URL}",
+                    parent=self,
+                )
+
     def _poll_log(self):
         self.copy_log_path_var.set(os.path.basename(current_copy_log_path()))
+        while not self.update_queue.empty():
+            version, release_url = self.update_queue.get_nowait()
+            download_now = messagebox.askyesno(
+                "Update available",
+                f"An update is available: {version}.\n\n"
+                "Would you like to download it now?",
+                parent=self,
+            )
+            if download_now:
+                try:
+                    opened = webbrowser.open(release_url)
+                except OSError as e:
+                    log(f"[ERROR] Could not open release page {release_url}: {e}")
+                    messagebox.showerror(
+                        "Could not open browser",
+                        f"Could not open the release page:\n{release_url}\n\n{e}",
+                        parent=self,
+                    )
+                else:
+                    if not opened:
+                        log(f"[ERROR] Could not open release page {release_url}.")
+                        messagebox.showerror(
+                            "Could not open browser",
+                            f"Could not open the release page:\n{release_url}",
+                            parent=self,
+                        )
         lines = []
         while not self.log_queue.empty():
             lines.append(self.log_queue.get_nowait())
